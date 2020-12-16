@@ -442,8 +442,9 @@ to update the working directory files.
     """
     # Opt.depth will be non-None if user actually passed --depth to repo init.
     if opt.depth is not None:
-      if opt.depth > 0:
-        # Positive values will set the depth.
+      if opt.depth > 0 or opt.depth == -1:
+        # Positive values will set the depth. -1 is a dummy value for forcing
+        # unshallow checkouts.
         depth = str(opt.depth)
       else:
         # Negative numbers will clear the depth; passing None to SetString

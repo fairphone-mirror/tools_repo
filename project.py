@@ -1151,10 +1151,14 @@ class Project(object):
     if tags is None:
       tags = self.sync_tags
 
-    if self.clone_depth:
+    repo_depth = self.manifest.manifestProject.config.GetString('repo.depth')
+    if repo_depth == "-1":
+      # -1 enforces full history and overrides the depth set per project.
+      depth = repo_depth
+    elif self.clone_depth:
       depth = self.clone_depth
     else:
-      depth = self.manifest.manifestProject.config.GetString('repo.depth')
+      depth = repo_depth
 
     # See if we can skip the network fetch entirely.
     if not (optimized_fetch and
@@ -2034,6 +2038,10 @@ class Project(object):
     # fetched from.
     # The repo project should also never be synced with partial depth.
     if self.manifest.IsMirror or self.relpath == '.repo/repo':
+      depth = None
+
+    # -1 is a dummy value to force unshallowing all projects.
+    if depth == "-1":
       depth = None
 
     if depth:

@@ -319,6 +319,8 @@ can be found.  Used when syncing a revision locked manifest in
 Attribute `clone-depth`: Set the depth to use when fetching this
 project.  If specified, this value will override any value given
 to repo init with the --depth option on the command line.
+Exception: If --depth -1 is set, `clone-depth` will be ignored and all
+checkouts will be unshallowed.
 
 Attribute `force-path`: Set to true to force this project to create the
 local mirror repository according to its `path` attribute (if supplied)
