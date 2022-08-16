@@ -83,7 +83,7 @@ the following meanings:
                  dest='orphans', action='store_true',
                  help="include objects in working directory outside of repo projects")
 
-  def _StatusHelper(self, quiet, project):
+  def _StatusHelper(self, quiet, local, project):
     """Obtains the status for a specific project.
 
     Obtains the status for a project, redirecting the output to
@@ -91,13 +91,17 @@ the following meanings:
 
     Args:
       quiet: Where to output the status.
+      local: a boolean, if True, the path is relative to the local
+             (sub)manifest.  If false, the path is relative to the
+             outermost manifest.
       project: Project to get status of.
 
     Returns:
       The status of the project.
     """
     buf = io.StringIO()
-    ret = project.PrintWorkTreeStatus(quiet=quiet, output_redir=buf)
+    ret = project.PrintWorkTreeStatus(quiet=quiet, output_redir=buf,
+                                      local=local)
     return (ret, buf.getvalue())
 
   def _FindOrphans(self, dirs, proj_dirs, proj_dirs_parents, outstring):
@@ -117,7 +121,7 @@ the following meanings:
       outstring.append(''.join([status_header, item, '/']))
 
   def Execute(self, opt, args):
-    all_projects = self.GetProjects(args)
+    all_projects = self.GetProjects(args, all_manifests=not opt.this_manifest_only)
 
     def _ProcessResults(_pool, _output, results):
       ret = 0
@@ -130,7 +134,7 @@ the following meanings:
 
     counter = self.ExecuteInParallel(
         opt.jobs,
-        functools.partial(self._StatusHelper, opt.quiet),
+        functools.partial(self._StatusHelper, opt.quiet, opt.this_manifest_only),
         all_projects,
         callback=_ProcessResults,
         ordered=True)
@@ -141,9 +145,10 @@ the following meanings:
     if opt.orphans:
       proj_dirs = set()
       proj_dirs_parents = set()
-      for project in self.GetProjects(None, missing_ok=True):
-        proj_dirs.add(project.relpath)
-        (head, _tail) = os.path.split(project.relpath)
+      for project in self.GetProjects(None, missing_ok=True, all_manifests=not opt.this_manifest_only):
+        relpath = project.RelPath(local=opt.this_manifest_only)
+        proj_dirs.add(relpath)
+        (head, _tail) = os.path.split(relpath)
         while head != "":
           proj_dirs_parents.add(head)
           (head, _tail) = os.path.split(head)

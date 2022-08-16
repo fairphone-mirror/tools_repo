@@ -204,6 +204,12 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
     p.add_option('-y', '--yes',
                  default=False, action='store_true',
                  help='answer yes to all safe prompts')
+    p.add_option('--ignore-untracked-files',
+                 action='store_true', default=False,
+                 help='ignore untracked files in the working copy')
+    p.add_option('--no-ignore-untracked-files',
+                 dest='ignore_untracked_files', action='store_false',
+                 help='always ask about untracked files in the working copy')
     p.add_option('--no-cert-checks',
                  dest='validate_certs', action='store_false', default=True,
                  help='disable verifying ssl certs (unsafe)')
@@ -226,7 +232,8 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
 
       destination = opt.dest_branch or project.dest_branch or project.revisionExpr
       print('Upload project %s/ to remote branch %s%s:' %
-            (project.relpath, destination, ' (private)' if opt.private else ''))
+            (project.RelPath(local=opt.this_manifest_only), destination,
+             ' (private)' if opt.private else ''))
       print('  branch %s (%2d commit%s, %s):' % (
           name,
           len(commit_list),
@@ -262,7 +269,7 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
     script.append('# Uncomment the branches to upload:')
     for project, avail in pending:
       script.append('#')
-      script.append('# project %s/:' % project.relpath)
+      script.append('# project %s/:' % project.RelPath(local=opt.this_manifest_only))
 
       b = {}
       for branch in avail:
@@ -285,7 +292,7 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
           script.append('#         %s' % commit)
         b[name] = branch
 
-      projects[project.relpath] = project
+      projects[project.RelPath(local=opt.this_manifest_only)] = project
       branches[project.name] = b
     script.append('')
 
@@ -313,7 +320,7 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
           _die('project for branch %s not in script', name)
         branch = branches[project.name].get(name)
         if not branch:
-          _die('branch %s not in %s', name, project.relpath)
+          _die('branch %s not in %s', name, project.RelPath(local=opt.this_manifest_only))
         todo.append(branch)
     if not todo:
       _die("nothing uncommented for upload")
@@ -369,6 +376,10 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
 
         # Check if there are local changes that may have been forgotten
         changes = branch.project.UncommitedFiles()
+        if opt.ignore_untracked_files:
+          untracked = set(branch.project.UntrackedFiles())
+          changes = [x for x in changes if x not in untracked]
+
         if changes:
           key = 'review.%s.autoupload' % branch.project.remote.review
           answer = branch.project.config.GetBoolean(key)
@@ -420,12 +431,6 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
         labels = set(_ExpandCommaList(branch.project.config.GetString(key)))
         for label in opt.labels:
           labels.update(_ExpandCommaList(label))
-        # Basic sanity check on label syntax.
-        for label in labels:
-          if not re.match(r'^.+[+-][0-9]+$', label):
-            print('repo: error: invalid label syntax "%s": labels use forms '
-                  'like CodeReview+1 or Verified-1' % (label,), file=sys.stderr)
-            sys.exit(1)
 
         # Handle e-mail notifications.
         if opt.notify is False:
@@ -481,7 +486,7 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
           else:
             fmt = '\n       (%s)'
           print(('[FAILED] %-15s %-15s' + fmt) % (
-              branch.project.relpath + '/',
+              branch.project.RelPath(local=opt.this_manifest_only) + '/',
               branch.name,
               str(branch.error)),
               file=sys.stderr)
@@ -490,7 +495,7 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
     for branch in todo:
       if branch.uploaded:
         print('[OK    ] %-15s %s' % (
-            branch.project.relpath + '/',
+            branch.project.RelPath(local=opt.this_manifest_only) + '/',
             branch.name),
             file=sys.stderr)
 
@@ -524,7 +529,7 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
     return (project, avail)
 
   def Execute(self, opt, args):
-    projects = self.GetProjects(args)
+    projects = self.GetProjects(args, all_manifests=not opt.this_manifest_only)
 
     def _ProcessResults(_pool, _out, results):
       pending = []
@@ -534,7 +539,8 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
           print('repo: error: %s: Unable to upload branch "%s". '
                 'You might be able to fix the branch by running:\n'
                 '  git branch --set-upstream-to m/%s' %
-                (project.relpath, project.CurrentBranch, self.manifest.branch),
+                (project.RelPath(local=opt.this_manifest_only), project.CurrentBranch,
+                 project.manifest.branch),
                 file=sys.stderr)
         elif avail:
           pending.append(result)
@@ -554,15 +560,23 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
               (opt.branch,), file=sys.stderr)
       return 1
 
-    pending_proj_names = [project.name for (project, available) in pending]
-    pending_worktrees = [project.worktree for (project, available) in pending]
-    hook = RepoHook.FromSubcmd(
-        hook_type='pre-upload', manifest=self.manifest,
-        opt=opt, abort_if_user_denies=True)
-    if not hook.Run(
-        project_list=pending_proj_names,
-        worktree_list=pending_worktrees):
-      return 1
+    manifests = {project.manifest.topdir: project.manifest
+                 for (project, available) in pending}
+    ret = 0
+    for manifest in manifests.values():
+      pending_proj_names = [project.name for (project, available) in pending
+                            if project.manifest.topdir == manifest.topdir]
+      pending_worktrees = [project.worktree for (project, available) in pending
+                           if project.manifest.topdir == manifest.topdir]
+      hook = RepoHook.FromSubcmd(
+          hook_type='pre-upload', manifest=manifest,
+          opt=opt, abort_if_user_denies=True)
+      if not hook.Run(
+          project_list=pending_proj_names,
+          worktree_list=pending_worktrees):
+        ret = 1
+    if ret:
+      return ret
 
     reviewers = _SplitEmails(opt.reviewers) if opt.reviewers else []
     cc = _SplitEmails(opt.cc) if opt.cc else []

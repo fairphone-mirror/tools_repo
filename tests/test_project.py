@@ -16,7 +16,7 @@
 
 import contextlib
 import os
-import shutil
+from pathlib import Path
 import subprocess
 import tempfile
 import unittest
@@ -31,11 +31,7 @@ import project
 @contextlib.contextmanager
 def TempGitTree():
   """Create a new empty git checkout for testing."""
-  # TODO(vapier): Convert this to tempfile.TemporaryDirectory once we drop
-  # Python 2 support entirely.
-  try:
-    tempdir = tempfile.mkdtemp(prefix='repo-tests')
-
+  with tempfile.TemporaryDirectory(prefix='repo-tests') as tempdir:
     # Tests need to assume, that main is default branch at init,
     # which is not supported in config until 2.28.
     cmd = ['git', 'init']
@@ -49,8 +45,6 @@ def TempGitTree():
       cmd += ['--template', templatedir]
     subprocess.check_call(cmd, cwd=tempdir)
     yield tempdir
-  finally:
-    platform_utils.rmtree(tempdir)
 
 
 class FakeProject(object):
@@ -123,14 +117,15 @@ class CopyLinkTestCase(unittest.TestCase):
   """
 
   def setUp(self):
-    self.tempdir = tempfile.mkdtemp(prefix='repo_tests')
+    self.tempdirobj = tempfile.TemporaryDirectory(prefix='repo_tests')
+    self.tempdir = self.tempdirobj.name
     self.topdir = os.path.join(self.tempdir, 'checkout')
     self.worktree = os.path.join(self.topdir, 'git-project')
     os.makedirs(self.topdir)
     os.makedirs(self.worktree)
 
   def tearDown(self):
-    shutil.rmtree(self.tempdir, ignore_errors=True)
+    self.tempdirobj.cleanup()
 
   @staticmethod
   def touch(path):
@@ -335,3 +330,76 @@ class LinkFile(CopyLinkTestCase):
     platform_utils.symlink(self.tempdir, dest)
     lf._Link()
     self.assertEqual(os.path.join('git-project', 'foo.txt'), os.readlink(dest))
+
+
+class MigrateWorkTreeTests(unittest.TestCase):
+  """Check _MigrateOldWorkTreeGitDir handling."""
+
+  _SYMLINKS = {
+      'config', 'description', 'hooks', 'info', 'logs', 'objects',
+      'packed-refs', 'refs', 'rr-cache', 'shallow', 'svn',
+  }
+  _FILES = {
+      'COMMIT_EDITMSG', 'FETCH_HEAD', 'HEAD', 'index', 'ORIG_HEAD',
+      'unknown-file-should-be-migrated',
+  }
+  _CLEAN_FILES = {
+      'a-vim-temp-file~', '#an-emacs-temp-file#',
+  }
+
+  @classmethod
+  @contextlib.contextmanager
+  def _simple_layout(cls):
+    """Create a simple repo client checkout to test against."""
+    with tempfile.TemporaryDirectory() as tempdir:
+      tempdir = Path(tempdir)
+
+      gitdir = tempdir / '.repo/projects/src/test.git'
+      gitdir.mkdir(parents=True)
+      cmd = ['git', 'init', '--bare', str(gitdir)]
+      subprocess.check_call(cmd)
+
+      dotgit = tempdir / 'src/test/.git'
+      dotgit.mkdir(parents=True)
+      for name in cls._SYMLINKS:
+        (dotgit / name).symlink_to(f'../../../.repo/projects/src/test.git/{name}')
+      for name in cls._FILES | cls._CLEAN_FILES:
+        (dotgit / name).write_text(name)
+
+      yield tempdir
+
+  def test_standard(self):
+    """Migrate a standard checkout that we expect."""
+    with self._simple_layout() as tempdir:
+      dotgit = tempdir / 'src/test/.git'
+      project.Project._MigrateOldWorkTreeGitDir(str(dotgit))
+
+      # Make sure the dir was transformed into a symlink.
+      self.assertTrue(dotgit.is_symlink())
+      self.assertEqual(os.readlink(dotgit), '../../.repo/projects/src/test.git')
+
+      # Make sure files were moved over.
+      gitdir = tempdir / '.repo/projects/src/test.git'
+      for name in self._FILES:
+        self.assertEqual(name, (gitdir / name).read_text())
+      # Make sure files were removed.
+      for name in self._CLEAN_FILES:
+        self.assertFalse((gitdir / name).exists())
+
+  def test_unknown(self):
+    """A checkout with unknown files should abort."""
+    with self._simple_layout() as tempdir:
+      dotgit = tempdir / 'src/test/.git'
+      (tempdir / '.repo/projects/src/test.git/random-file').write_text('one')
+      (dotgit / 'random-file').write_text('two')
+      with self.assertRaises(error.GitError):
+        project.Project._MigrateOldWorkTreeGitDir(str(dotgit))
+
+      # Make sure no content was actually changed.
+      self.assertTrue(dotgit.is_dir())
+      for name in self._FILES:
+        self.assertTrue((dotgit / name).is_file())
+      for name in self._CLEAN_FILES:
+        self.assertTrue((dotgit / name).is_file())
+      for name in self._SYMLINKS:
+        self.assertTrue((dotgit / name).is_symlink())
