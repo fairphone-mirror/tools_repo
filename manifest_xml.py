@@ -123,7 +123,7 @@ class _Default(object):
   destBranchExpr = None
   upstreamExpr = None
   remote = None
-  sync_j = 1
+  sync_j = None
   sync_c = False
   sync_s = False
   sync_tags = True
@@ -284,7 +284,7 @@ class _XmlSubmanifest:
     if self.project:
       manifestUrl = remote.ToRemoteSpec(self.project).url
     else:
-      manifestUrl = mp.GetRemote(mp.remote.name).url
+      manifestUrl = mp.GetRemote().url
     manifestName = self.manifestName or 'default.xml'
     revision = self.revision or self.name
     path = self.path or revision.split('/')[-1]
@@ -358,7 +358,10 @@ class XmlManifest(object):
 
     self.repodir = os.path.abspath(repodir)
     self._CheckLocalPath(submanifest_path)
-    self.topdir = os.path.join(os.path.dirname(self.repodir), submanifest_path)
+    self.topdir = os.path.dirname(self.repodir)
+    if submanifest_path:
+      # This avoids a trailing os.path.sep when submanifest_path is empty.
+      self.topdir = os.path.join(self.topdir, submanifest_path)
     if manifest_file != os.path.abspath(manifest_file):
       raise ManifestParseError('manifest_file must be abspath')
     self.manifestFile = manifest_file
@@ -548,7 +551,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
     if d.upstreamExpr:
       have_default = True
       e.setAttribute('upstream', d.upstreamExpr)
-    if d.sync_j > 1:
+    if d.sync_j is not None:
       have_default = True
       e.setAttribute('sync-j', '%d' % d.sync_j)
     if d.sync_c:
@@ -1385,7 +1388,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
 
   def _AddMetaProjectMirror(self, m):
     name = None
-    m_url = m.GetRemote(m.remote.name).url
+    m_url = m.GetRemote().url
     if m_url.endswith('/.git'):
       raise ManifestParseError('refusing to mirror %s' % m_url)
 
@@ -1462,8 +1465,8 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
     d.destBranchExpr = node.getAttribute('dest-branch') or None
     d.upstreamExpr = node.getAttribute('upstream') or None
 
-    d.sync_j = XmlInt(node, 'sync-j', 1)
-    if d.sync_j <= 0:
+    d.sync_j = XmlInt(node, 'sync-j', None)
+    if d.sync_j is not None and d.sync_j <= 0:
       raise ManifestParseError('%s: sync-j must be greater than 0, not "%s"' %
                                (self.manifestFile, d.sync_j))
 

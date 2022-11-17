@@ -28,6 +28,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.parsers.expat
 import xmlrpc.client
 
 try:
@@ -52,7 +53,7 @@ import git_superproject
 import gitc_utils
 from project import Project
 from project import RemoteSpec
-from command import Command, MirrorSafeCommand, WORKER_BATCH_SIZE
+from command import Command, DEFAULT_LOCAL_JOBS, MirrorSafeCommand, WORKER_BATCH_SIZE
 from error import RepoChangedException, GitError, ManifestParseError
 import platform_utils
 from project import SyncBuffer
@@ -65,7 +66,6 @@ _ONE_DAY_S = 24 * 60 * 60
 
 
 class Sync(Command, MirrorSafeCommand):
-  jobs = 1
   COMMON = True
   MULTI_MANIFEST_SUPPORT = True
   helpSummary = "Update working tree to the latest revision"
@@ -168,21 +168,16 @@ If the remote SSH daemon is Gerrit Code Review, version 2.0.10 or
 later is required to fix a server side protocol bug.
 
 """
-  PARALLEL_JOBS = 1
-
-  def _CommonOptions(self, p):
-    if self.outer_client and self.outer_client.manifest:
-      try:
-        self.PARALLEL_JOBS = self.outer_client.manifest.default.sync_j
-      except ManifestParseError:
-        pass
-    super()._CommonOptions(p)
+  # A value of 0 means we want parallel jobs, but we'll determine the default
+  # value later on.
+  PARALLEL_JOBS = 0
 
   def _Options(self, p, show_smart=True):
     p.add_option('--jobs-network', default=None, type=int, metavar='JOBS',
-                 help='number of network jobs to run in parallel (defaults to --jobs)')
+                 help='number of network jobs to run in parallel (defaults to --jobs or 1)')
     p.add_option('--jobs-checkout', default=None, type=int, metavar='JOBS',
-                 help='number of local checkout jobs to run in parallel (defaults to --jobs)')
+                 help='number of local checkout jobs to run in parallel (defaults to --jobs or '
+                      f'{DEFAULT_LOCAL_JOBS})')
 
     p.add_option('-f', '--force-broken',
                  dest='force_broken', action='store_true',
@@ -451,7 +446,7 @@ later is required to fix a server side protocol bug.
   def _Fetch(self, projects, opt, err_event, ssh_proxy):
     ret = True
 
-    jobs = opt.jobs_network if opt.jobs_network else self.jobs
+    jobs = opt.jobs_network
     fetched = set()
     pm = Progress('Fetching', len(projects), delay=False, quiet=opt.quiet)
 
@@ -651,7 +646,7 @@ later is required to fix a server side protocol bug.
       return ret
 
     return self.ExecuteInParallel(
-        opt.jobs_checkout if opt.jobs_checkout else self.jobs,
+        opt.jobs_checkout,
         functools.partial(self._CheckoutOne, opt.detach_head, opt.force_sync),
         all_projects,
         callback=_ProcessResults,
@@ -663,21 +658,27 @@ later is required to fix a server side protocol bug.
 
     tidy_dirs = {}
     for project in projects:
-      # Make sure pruning never kicks in with shared projects.
+      # Make sure pruning never kicks in with shared projects that do not use
+      # alternates to avoid corruption.
       if (not project.use_git_worktrees and
               len(project.manifest.GetProjectsWithName(project.name, all_manifests=True)) > 1):
-        if not opt.quiet:
-          print('\r%s: Shared project %s found, disabling pruning.' %
-                (project.relpath, project.name))
-        if git_require((2, 7, 0)):
-          project.EnableRepositoryExtension('preciousObjects')
+        if project.UseAlternates:
+          # Undo logic set by previous versions of repo.
+          project.config.SetString('extensions.preciousObjects', None)
+          project.config.SetString('gc.pruneExpire', None)
         else:
-          # This isn't perfect, but it's the best we can do with old git.
-          print('\r%s: WARNING: shared projects are unreliable when using old '
-                'versions of git; please upgrade to git-2.7.0+.'
-                % (project.relpath,),
-                file=sys.stderr)
-          project.config.SetString('gc.pruneExpire', 'never')
+          if not opt.quiet:
+            print('\r%s: Shared project %s found, disabling pruning.' %
+                  (project.relpath, project.name))
+          if git_require((2, 7, 0)):
+            project.EnableRepositoryExtension('preciousObjects')
+          else:
+            # This isn't perfect, but it's the best we can do with old git.
+            print('\r%s: WARNING: shared projects are unreliable when using old '
+                  'versions of git; please upgrade to git-2.7.0+.'
+                  % (project.relpath,),
+                  file=sys.stderr)
+            project.config.SetString('gc.pruneExpire', 'never')
       project.config.SetString('gc.autoDetach', 'false')
       # Only call git gc once per objdir, but call pack-refs for the remainder.
       if project.objdir not in tidy_dirs:
@@ -691,8 +692,7 @@ later is required to fix a server side protocol bug.
             project.bare_git,
         )
 
-    cpu_count = os.cpu_count()
-    jobs = min(self.jobs, cpu_count)
+    jobs = opt.jobs
 
     if jobs < 2:
       for (run_gc, bare_git) in tidy_dirs.values():
@@ -704,6 +704,7 @@ later is required to fix a server side protocol bug.
       pm.end()
       return
 
+    cpu_count = os.cpu_count()
     config = {'pack.threads': cpu_count // jobs if cpu_count > jobs else 1}
 
     threads = set()
@@ -1011,9 +1012,6 @@ later is required to fix a server side protocol bug.
         sys.exit(1)
       self._ReloadManifest(manifest_name, mp.manifest)
 
-      if opt.jobs is None:
-        self.jobs = mp.manifest.default.sync_j
-
   def ValidateOptions(self, opt, args):
     if opt.force_broken:
       print('warning: -f/--force-broken is now the default behavior, and the '
@@ -1036,12 +1034,6 @@ later is required to fix a server side protocol bug.
       opt.prune = True
 
   def Execute(self, opt, args):
-    if opt.jobs:
-      self.jobs = opt.jobs
-    if self.jobs > 1:
-      soft_limit, _ = _rlimit_nofile()
-      self.jobs = min(self.jobs, (soft_limit - 5) // 3)
-
     manifest = self.outer_manifest
     if not opt.outer_manifest:
       manifest = self.manifest
@@ -1079,18 +1071,47 @@ later is required to fix a server side protocol bug.
               file=sys.stderr)
 
     for m in self.ManifestList(opt):
-      mp = m.manifestProject
-      is_standalone_manifest = bool(mp.standalone_manifest_url)
-      if not is_standalone_manifest:
-        mp.PreSync()
+      if not m.manifestProject.standalone_manifest_url:
+        m.manifestProject.PreSync()
 
-      if opt.repo_upgraded:
-        _PostRepoUpgrade(m, quiet=opt.quiet)
+    if opt.repo_upgraded:
+      _PostRepoUpgrade(manifest, quiet=opt.quiet)
 
+    mp = manifest.manifestProject
     if opt.mp_update:
       self._UpdateAllManifestProjects(opt, mp, manifest_name)
     else:
       print('Skipping update of local manifest project.')
+
+    # Now that the manifests are up-to-date, setup the jobs value.
+    if opt.jobs is None:
+      # User has not made a choice, so use the manifest settings.
+      opt.jobs = mp.default.sync_j
+    if opt.jobs is not None:
+      # Neither user nor manifest have made a choice.
+      if opt.jobs_network is None:
+        opt.jobs_network = opt.jobs
+      if opt.jobs_checkout is None:
+        opt.jobs_checkout = opt.jobs
+    # Setup defaults if jobs==0.
+    if not opt.jobs:
+      if not opt.jobs_network:
+        opt.jobs_network = 1
+      if not opt.jobs_checkout:
+        opt.jobs_checkout = DEFAULT_LOCAL_JOBS
+      opt.jobs = os.cpu_count()
+
+    # Try to stay under user rlimit settings.
+    #
+    # Since each worker requires at 3 file descriptors to run `git fetch`, use
+    # that to scale down the number of jobs.  Unfortunately there isn't an easy
+    # way to determine this reliably as systems change, but it was last measured
+    # by hand in 2011.
+    soft_limit, _ = _rlimit_nofile()
+    jobs_soft_limit = max(1, (soft_limit - 5) // 3)
+    opt.jobs = min(opt.jobs, jobs_soft_limit)
+    opt.jobs_network = min(opt.jobs_network, jobs_soft_limit)
+    opt.jobs_checkout = min(opt.jobs_checkout, jobs_soft_limit)
 
     superproject_logging_data = {}
     self._UpdateProjectsRevisionId(opt, args, superproject_logging_data,
@@ -1410,11 +1431,16 @@ class PersistentTransport(xmlrpc.client.Transport):
           raise
 
       p, u = xmlrpc.client.getparser()
-      while 1:
-        data = response.read(1024)
-        if not data:
-          break
+      # Response should be fairly small, so read it all at once.
+      # This way we can show it to the user in case of error (e.g. HTML).
+      data = response.read()
+      try:
         p.feed(data)
+      except xml.parsers.expat.ExpatError as e:
+        raise IOError(
+            f'Parsing the manifest failed: {e}\n'
+            f'Please report this to your manifest server admin.\n'
+            f'Here is the full response:\n{data.decode("utf-8")}')
       p.close()
       return u.close()
 

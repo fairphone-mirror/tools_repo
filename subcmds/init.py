@@ -109,6 +109,10 @@ to update the working directory files.
     Args:
       opt: options from optparse.
     """
+    # Normally this value is set when instantiating the project, but the
+    # manifest project is special and is created when instantiating the
+    # manifest which happens before we parse options.
+    self.manifest.manifestProject.clone_depth = opt.manifest_depth
     if not self.manifest.manifestProject.Sync(
         manifest_url=opt.manifest_url,
         manifest_branch=opt.manifest_branch,
@@ -144,7 +148,7 @@ to update the working directory files.
       return value
     return a
 
-  def _ShouldConfigureUser(self, opt):
+  def _ShouldConfigureUser(self, opt, existing_checkout):
     gc = self.client.globalConfig
     mp = self.manifest.manifestProject
 
@@ -156,7 +160,7 @@ to update the working directory files.
       mp.config.SetString('user.name', gc.GetString('user.name'))
       mp.config.SetString('user.email', gc.GetString('user.email'))
 
-    if not opt.quiet:
+    if not opt.quiet and not existing_checkout or opt.verbose:
       print()
       print('Your identity is: %s <%s>' % (mp.config.GetString('user.name'),
                                            mp.config.GetString('user.email')))
@@ -241,7 +245,7 @@ to update the working directory files.
     if current_dir != self.manifest.topdir:
       print('If this is not the directory in which you want to initialize '
             'repo, please run:')
-      print('   rm -r %s/.repo' % self.manifest.topdir)
+      print('   rm -r %s' % os.path.join(self.manifest.topdir, '.repo'))
       print('and try again.')
 
   def ValidateOptions(self, opt, args):
@@ -311,10 +315,17 @@ to update the working directory files.
       # Older versions of git supported worktree, but had dangerous gc bugs.
       git_require((2, 15, 0), fail=True, msg='git gc worktree corruption')
 
+    # Provide a short notice that we're reinitializing an existing checkout.
+    # Sometimes developers might not realize that they're in one, or that
+    # repo doesn't do nested checkouts.
+    existing_checkout = self.manifest.manifestProject.Exists
+    if not opt.quiet and existing_checkout:
+      print('repo: reusing existing repo client checkout in', self.manifest.topdir)
+
     self._SyncManifest(opt)
 
     if os.isatty(0) and os.isatty(1) and not self.manifest.IsMirror:
-      if opt.config_name or self._ShouldConfigureUser(opt):
+      if opt.config_name or self._ShouldConfigureUser(opt, existing_checkout):
         self._ConfigureUser(opt)
       self._ConfigureColor()
 

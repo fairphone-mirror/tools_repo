@@ -78,6 +78,13 @@ added to the respective list of users, and emails are sent to any
 new users.  Users passed as --reviewers must already be registered
 with the code review system, or the upload will fail.
 
+While most normal Gerrit options have dedicated command line options,
+direct access to the Gerit options is available via --push-options.
+This is useful when Gerrit has newer functionality that %prog doesn't
+yet support, or doesn't have plans to support.  See the Push Options
+documentation for more details:
+https://gerrit-review.googlesource.com/Documentation/user-upload.html#push_options
+
 # Configuration
 
 review.URL.autoupload:
@@ -190,6 +197,9 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
     p.add_option('-w', '--wip',
                  action='store_true', dest='wip', default=False,
                  help='upload as a work-in-progress change')
+    p.add_option('-r', '--ready',
+                 action='store_true', default=False,
+                 help='mark change as ready (clears work-in-progress setting)')
     p.add_option('-o', '--push-option',
                  type='string', action='append', dest='push_options',
                  default=[],
@@ -252,7 +262,7 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
         answer = sys.stdin.readline().strip().lower()
         answer = answer in ('y', 'yes', '1', 'true', 't')
 
-    if answer:
+    if not opt.yes and answer:
       if len(branch.commits) > UNUSUAL_COMMIT_THRESHOLD:
         answer = _ConfirmManyUploads()
 
@@ -325,14 +335,15 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
     if not todo:
       _die("nothing uncommented for upload")
 
-    many_commits = False
-    for branch in todo:
-      if len(branch.commits) > UNUSUAL_COMMIT_THRESHOLD:
-        many_commits = True
-        break
-    if many_commits:
-      if not _ConfirmManyUploads(multiple_branches=True):
-        _die("upload aborted by user")
+    if not opt.yes:
+      many_commits = False
+      for branch in todo:
+        if len(branch.commits) > UNUSUAL_COMMIT_THRESHOLD:
+          many_commits = True
+          break
+      if many_commits:
+        if not _ConfirmManyUploads(multiple_branches=True):
+          _die("upload aborted by user")
 
     self._UploadAndReport(opt, todo, people)
 
@@ -465,6 +476,7 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
                                private=opt.private,
                                notify=notify,
                                wip=opt.wip,
+                               ready=opt.ready,
                                dest_branch=destination,
                                validate_certs=opt.validate_certs,
                                push_options=opt.push_options)
