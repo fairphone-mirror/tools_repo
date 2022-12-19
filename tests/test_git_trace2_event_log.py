@@ -369,7 +369,7 @@ class EventLogTestCase(unittest.TestCase):
         server_thread.start()
 
         with server_ready:
-          server_ready.wait()
+          server_ready.wait(timeout=120)
 
         self._event_log_module.StartEvent()
         path = self._event_log_module.Write(path=f'af_unix:{socket_path}')
@@ -385,7 +385,3 @@ class EventLogTestCase(unittest.TestCase):
     # Check for 'start' event specific fields.
     self.assertIn('argv', start_event)
     self.assertIsInstance(start_event['argv'], list)
-
-
-if __name__ == '__main__':
-  unittest.main()

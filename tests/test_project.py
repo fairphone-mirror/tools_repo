@@ -22,10 +22,12 @@ import tempfile
 import unittest
 
 import error
+import manifest_xml
 import git_command
 import git_config
 import platform_utils
 import project
+import repo_trace
 
 
 @contextlib.contextmanager
@@ -63,6 +65,13 @@ class FakeProject(object):
 
 class ReviewableBranchTests(unittest.TestCase):
   """Check ReviewableBranch behavior."""
+
+  def setUp(self):
+    self.tempdirobj = tempfile.TemporaryDirectory(prefix='repo_tests')
+    repo_trace._TRACE_FILE = os.path.join(self.tempdirobj.name, 'TRACE_FILE_from_test')
+
+  def tearDown(self):
+    self.tempdirobj.cleanup()
 
   def test_smoke(self):
     """A quick run through everything."""
@@ -376,7 +385,7 @@ class MigrateWorkTreeTests(unittest.TestCase):
 
       # Make sure the dir was transformed into a symlink.
       self.assertTrue(dotgit.is_symlink())
-      self.assertEqual(os.readlink(dotgit), '../../.repo/projects/src/test.git')
+      self.assertEqual(os.readlink(dotgit), os.path.normpath('../../.repo/projects/src/test.git'))
 
       # Make sure files were moved over.
       gitdir = tempdir / '.repo/projects/src/test.git'
@@ -403,3 +412,81 @@ class MigrateWorkTreeTests(unittest.TestCase):
         self.assertTrue((dotgit / name).is_file())
       for name in self._SYMLINKS:
         self.assertTrue((dotgit / name).is_symlink())
+
+
+class ManifestPropertiesFetchedCorrectly(unittest.TestCase):
+  """Ensure properties are fetched properly."""
+
+  def setUpManifest(self, tempdir):
+    repo_trace._TRACE_FILE = os.path.join(tempdir, 'TRACE_FILE_from_test')
+
+    repodir = os.path.join(tempdir, '.repo')
+    manifest_dir = os.path.join(repodir, 'manifests')
+    manifest_file = os.path.join(
+        repodir, manifest_xml.MANIFEST_FILE_NAME)
+    local_manifest_dir = os.path.join(
+        repodir, manifest_xml.LOCAL_MANIFESTS_DIR_NAME)
+    os.mkdir(repodir)
+    os.mkdir(manifest_dir)
+    manifest = manifest_xml.XmlManifest(repodir, manifest_file)
+
+    return project.ManifestProject(
+        manifest, 'test/manifest', os.path.join(tempdir, '.git'), tempdir)
+
+  def test_manifest_config_properties(self):
+    """Test we are fetching the manifest config properties correctly."""
+
+    with TempGitTree() as tempdir:
+      fakeproj = self.setUpManifest(tempdir)
+
+      # Set property using the expected Set method, then ensure
+      # the porperty functions are using the correct Get methods.
+      fakeproj.config.SetString(
+          'manifest.standalone', 'https://chicken/manifest.git')
+      self.assertEqual(
+          fakeproj.standalone_manifest_url, 'https://chicken/manifest.git')
+
+      fakeproj.config.SetString('manifest.groups', 'test-group, admin-group')
+      self.assertEqual(fakeproj.manifest_groups, 'test-group, admin-group')
+
+      fakeproj.config.SetString('repo.reference', 'mirror/ref')
+      self.assertEqual(fakeproj.reference, 'mirror/ref')
+
+      fakeproj.config.SetBoolean('repo.dissociate', False)
+      self.assertFalse(fakeproj.dissociate)
+
+      fakeproj.config.SetBoolean('repo.archive', False)
+      self.assertFalse(fakeproj.archive)
+
+      fakeproj.config.SetBoolean('repo.mirror', False)
+      self.assertFalse(fakeproj.mirror)
+
+      fakeproj.config.SetBoolean('repo.worktree', False)
+      self.assertFalse(fakeproj.use_worktree)
+
+      fakeproj.config.SetBoolean('repo.clonebundle', False)
+      self.assertFalse(fakeproj.clone_bundle)
+
+      fakeproj.config.SetBoolean('repo.submodules', False)
+      self.assertFalse(fakeproj.submodules)
+
+      fakeproj.config.SetBoolean('repo.git-lfs', False)
+      self.assertFalse(fakeproj.git_lfs)
+
+      fakeproj.config.SetBoolean('repo.superproject', False)
+      self.assertFalse(fakeproj.use_superproject)
+
+      fakeproj.config.SetBoolean('repo.partialclone', False)
+      self.assertFalse(fakeproj.partial_clone)
+
+      fakeproj.config.SetString('repo.depth', '48')
+      self.assertEqual(fakeproj.depth, '48')
+
+      fakeproj.config.SetString('repo.clonefilter', 'blob:limit=10M')
+      self.assertEqual(fakeproj.clone_filter, 'blob:limit=10M')
+
+      fakeproj.config.SetString('repo.partialcloneexclude', 'third_party/big_repo')
+      self.assertEqual(fakeproj.partial_clone_exclude, 'third_party/big_repo')
+
+      fakeproj.config.SetString('manifest.platform', 'auto')
+      self.assertEqual(fakeproj.manifest_platform, 'auto')

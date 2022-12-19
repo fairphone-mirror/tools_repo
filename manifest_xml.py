@@ -1289,6 +1289,8 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
           remote = self._default.remote
         else:
           remote = self._get_remote(node)
+        dest_branch = node.getAttribute('dest-branch')
+        upstream = node.getAttribute('upstream')
 
         named_projects = self._projects[name]
         if dest_path and not path and len(named_projects) > 1:
@@ -1304,6 +1306,10 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
 
           if remote_name:
             p.remote = remote.ToRemoteSpec(name)
+          if dest_branch:
+            p.dest_branch = dest_branch
+          if upstream:
+            p.upstream = upstream
 
           if dest_path:
             del self._paths[p.relpath]
@@ -1940,11 +1946,14 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
     fromKeys = sorted(fromProjects.keys())
     toKeys = sorted(toProjects.keys())
 
-    diff = {'added': [], 'removed': [], 'changed': [], 'unreachable': []}
+    diff = {'added': [], 'removed': [], 'missing': [], 'changed': [], 'unreachable': []}
 
     for proj in fromKeys:
       if proj not in toKeys:
         diff['removed'].append(fromProjects[proj])
+      elif not fromProjects[proj].Exists:
+        diff['missing'].append(toProjects[proj])
+        toKeys.remove(proj)
       else:
         fromProj = fromProjects[proj]
         toProj = toProjects[proj]

@@ -26,6 +26,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from typing import NamedTuple
 import urllib.parse
 
 from color import Coloring
@@ -40,17 +41,25 @@ from error import ManifestInvalidRevisionError, ManifestInvalidPathError
 from error import NoManifestException, ManifestParseError
 import platform_utils
 import progress
-from repo_trace import IsTrace, Trace
+from repo_trace import Trace
 
 from git_refs import GitRefs, HEAD, R_HEADS, R_TAGS, R_PUB, R_M, R_WORKTREE_M
 
+
+class SyncNetworkHalfResult(NamedTuple):
+  """Sync_NetworkHalf return value."""
+  # True if successful.
+  success: bool
+  # Did we query the remote? False when optimized_fetch is True and we have the
+  # commit already present.
+  remote_fetched: bool
 
 # Maximum sleep time allowed during retries.
 MAXIMUM_RETRY_SLEEP_SEC = 3600.0
 # +-10% random jitter is added to each Fetches retry sleep duration.
 RETRY_JITTER_PERCENT = 0.1
 
-# Whether to use alternates.
+# Whether to use alternates.  Switching back and forth is *NOT* supported.
 # TODO(vapier): Remove knob once behavior is verified.
 _ALTERNATES = os.environ.get('REPO_USE_ALTERNATES') == '1'
 
@@ -1133,7 +1142,7 @@ class Project(object):
     if archive and not isinstance(self, MetaProject):
       if self.remote.url.startswith(('http://', 'https://')):
         _error("%s: Cannot fetch archives from http/https remotes.", self.name)
-        return False
+        return SyncNetworkHalfResult(False, False)
 
       name = self.relpath.replace('\\', '/')
       name = name.replace('/', '_')
@@ -1144,19 +1153,19 @@ class Project(object):
         self._FetchArchive(tarpath, cwd=topdir)
       except GitError as e:
         _error('%s', e)
-        return False
+        return SyncNetworkHalfResult(False, False)
 
       # From now on, we only need absolute tarpath
       tarpath = os.path.join(topdir, tarpath)
 
       if not self._ExtractArchive(tarpath, path=topdir):
-        return False
+        return SyncNetworkHalfResult(False, True)
       try:
         platform_utils.remove(tarpath)
       except OSError as e:
         _warn("Cannot remove archive %s: %s", tarpath, str(e))
       self._CopyAndLinkFiles()
-      return True
+      return SyncNetworkHalfResult(True, True)
 
     # If the shared object dir already exists, don't try to rebootstrap with a
     # clone bundle download.  We should have the majority of objects already.
@@ -1224,9 +1233,11 @@ class Project(object):
       depth = repo_depth
 
     # See if we can skip the network fetch entirely.
+    remote_fetched = False
     if not (optimized_fetch and
             (ID_RE.match(self.revisionExpr) and
              self._CheckForImmutableRevision())):
+      remote_fetched = True
       if not self._RemoteFetch(
               initial=is_new,
               quiet=quiet, verbose=verbose, output_redir=output_redir,
@@ -1235,7 +1246,7 @@ class Project(object):
               submodules=submodules, force_sync=force_sync,
               ssh_proxy=ssh_proxy,
               clone_filter=clone_filter, retry_fetches=retry_fetches):
-        return False
+        return SyncNetworkHalfResult(False, remote_fetched)
 
     mp = self.manifest.manifestProject
     dissociate = mp.dissociate
@@ -1248,7 +1259,7 @@ class Project(object):
         if p.stdout and output_redir:
           output_redir.write(p.stdout)
         if p.Wait() != 0:
-          return False
+          return SyncNetworkHalfResult(False, remote_fetched)
         platform_utils.remove(alternates_file)
 
     if self.worktree:
@@ -1257,7 +1268,7 @@ class Project(object):
       self._InitMirrorHead()
       platform_utils.remove(os.path.join(self.gitdir, 'FETCH_HEAD'),
                             missing_ok=True)
-    return True
+    return SyncNetworkHalfResult(True, remote_fetched)
 
   def PostRepoUpgrade(self):
     self._InitHooks()
@@ -1455,6 +1466,8 @@ class Project(object):
         cnt_mine += 1
 
     if not upstream_gain and cnt_mine == len(local_changes):
+      # The copy/linkfile config may have changed.
+      self._CopyAndLinkFiles()
       return
 
     if self.IsDirty(consider_untracked=False):
@@ -2411,16 +2424,16 @@ class Project(object):
         srcUrl = 'http' + srcUrl[len('persistent-http'):]
       cmd += [srcUrl]
 
-      if IsTrace():
-        Trace('%s', ' '.join(cmd))
-      if verbose:
-        print('%s: Downloading bundle: %s' % (self.name, srcUrl))
-      stdout = None if verbose else subprocess.PIPE
-      stderr = None if verbose else subprocess.STDOUT
-      try:
-        proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr)
-      except OSError:
-        return False
+      proc = None
+      with Trace('Fetching bundle: %s', ' '.join(cmd)):
+        if verbose:
+          print('%s: Downloading bundle: %s' % (self.name, srcUrl))
+        stdout = None if verbose else subprocess.PIPE
+        stderr = None if verbose else subprocess.STDOUT
+        try:
+          proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr)
+        except OSError:
+          return False
 
       (output, _) = proc.communicate()
       curlret = proc.returncode
@@ -2801,35 +2814,6 @@ class Project(object):
           raise DownloadError(self._get_symlink_error_message())
         else:
           raise
-
-  def _InitialCheckoutStart(self):
-    """Called when checking out a project for the first time.
-
-    This will use temporary non-visible paths so we can be safely interrupted
-    without leaving incomplete state behind.
-    """
-    paths = [f'{x}.tmp' for x in (self.relpath, self.worktree, self.gitdir, self.objdir)]
-    for p in paths:
-      platform_utils.rmtree(p, ignore_errors=True)
-    self.UpdatePaths(*paths)
-
-  def _InitialCheckoutFinalizeNetworkHalf(self):
-    """Finalize the object dirs after network syncing works."""
-    # Once the network half finishes, we can move the objects into the right
-    # place by removing the ".tmp" suffix on the dirs.
-    platform_utils.rmtree(self.gitdir[:-4], ignore_errors=True)
-    os.rename(self.gitdir, self.gitdir[:-4])
-    self.UpdatePaths(self.relpath, self.worktree, self.gitdir[:-4], self.objdir[:-4])
-
-  def _InitialCheckoutFinalizeLocalHalf(self):
-    """Finalize the initial checkout and make it available."""
-    assert self.gitdir == self.objdir
-    # Once the local half finishes, we can move the manifest dir into the right
-    # place by removing the ".tmp" suffix on the dirs.
-    platform_utils.rmtree(self.worktree[:-4], ignore_errors=True)
-    os.rename(self.worktree, self.worktree[:-4])
-    self.UpdatePaths(
-        self.relpath[:-4], self.worktree[:-4], self.gitdir, self.objdir)
 
   def _InitGitWorktree(self):
     """Init the project using git worktrees."""
@@ -3529,7 +3513,7 @@ class ManifestProject(MetaProject):
   @property
   def partial_clone_exclude(self):
     """Partial clone exclude string"""
-    return self.config.GetBoolean('repo.partialcloneexclude')
+    return self.config.GetString('repo.partialcloneexclude')
 
   @property
   def manifest_platform(self):
@@ -3717,8 +3701,6 @@ class ManifestProject(MetaProject):
               (GitConfig.ForUser().UrlInsteadOf(manifest_url),),
               file=sys.stderr)
 
-      self._InitialCheckoutStart()
-
       # The manifest project object doesn't keep track of the path on the
       # server where this git is located, so let's save that here.
       mirrored_manifest_git = None
@@ -3875,16 +3857,18 @@ class ManifestProject(MetaProject):
           is_new=is_new, quiet=not verbose, verbose=verbose,
           clone_bundle=clone_bundle, current_branch_only=current_branch_only,
           tags=tags, submodules=submodules, clone_filter=clone_filter,
-          partial_clone_exclude=self.manifest.PartialCloneExclude):
+          partial_clone_exclude=self.manifest.PartialCloneExclude).success:
         r = self.GetRemote()
         print('fatal: cannot obtain manifest %s' % r.url, file=sys.stderr)
+
+        # Better delete the manifest git dir if we created it; otherwise next
+        # time (when user fixes problems) we won't go through the "is_new" logic.
+        if is_new:
+          platform_utils.rmtree(self.gitdir)
         return False
 
       if manifest_branch:
         self.MetaBranchSwitch(submodules=submodules)
-
-      if is_new:
-        self._InitialCheckoutFinalizeNetworkHalf()
 
       syncbuf = SyncBuffer(self.config)
       self.Sync_LocalHalf(syncbuf, submodules=submodules)
@@ -3907,9 +3891,6 @@ class ManifestProject(MetaProject):
       os.makedirs(os.path.dirname(dest), exist_ok=True)
       with open(dest, 'wb') as f:
         f.write(manifest_data)
-
-    if is_new:
-      self._InitialCheckoutFinalizeLocalHalf()
 
     try:
       self.manifest.Link(manifest_name)

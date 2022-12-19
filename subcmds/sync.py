@@ -25,6 +25,7 @@ import socket
 import sys
 import tempfile
 import time
+from typing import NamedTuple, List, Set
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -58,11 +59,69 @@ from error import RepoChangedException, GitError, ManifestParseError
 import platform_utils
 from project import SyncBuffer
 from progress import Progress
+from repo_trace import Trace
 import ssh
 from wrapper import Wrapper
 from manifest_xml import GitcManifest
 
 _ONE_DAY_S = 24 * 60 * 60
+
+# Env var to implicitly turn auto-gc back on.  This was added to allow a user to
+# revert a change in default behavior in v2.29.9.  Remove after 2023-04-01.
+_REPO_AUTO_GC = 'REPO_AUTO_GC'
+_AUTO_GC = os.environ.get(_REPO_AUTO_GC) == '1'
+
+
+class _FetchOneResult(NamedTuple):
+  """_FetchOne return value.
+
+  Attributes:
+    success (bool): True if successful.
+    project (Project): The fetched project.
+    start (float): The starting time.time().
+    finish (float): The ending time.time().
+    remote_fetched (bool): True if the remote was actually queried.
+  """
+  success: bool
+  project: Project
+  start: float
+  finish: float
+  remote_fetched: bool
+
+
+class _FetchResult(NamedTuple):
+  """_Fetch return value.
+
+  Attributes:
+    success (bool): True if successful.
+    projects (Set[str]): The names of the git directories of fetched projects.
+  """
+  success: bool
+  projects: Set[str]
+
+
+class _FetchMainResult(NamedTuple):
+  """_FetchMain return value.
+
+  Attributes:
+    all_projects (List[Project]): The fetched projects.
+  """
+  all_projects: List[Project]
+
+
+class _CheckoutOneResult(NamedTuple):
+  """_CheckoutOne return value.
+
+  Attributes:
+    success (bool): True if successful.
+    project (Project): The project.
+    start (float): The starting time.time().
+    finish (float): The ending time.time().
+  """
+  success: bool
+  project: Project
+  start: float
+  finish: float
 
 
 class Sync(Command, MirrorSafeCommand):
@@ -140,6 +199,9 @@ exist locally.
 
 The --prune option can be used to remove any refs that no longer
 exist on the remote.
+
+The --auto-gc option can be used to trigger garbage collection on all
+projects. By default, repo does not run garbage collection.
 
 # SSH Connections
 
@@ -250,6 +312,10 @@ later is required to fix a server side protocol bug.
                  help='delete refs that no longer exist on the remote (default)')
     p.add_option('--no-prune', dest='prune', action='store_false',
                  help='do not delete refs that no longer exist on the remote')
+    p.add_option('--auto-gc', action='store_true', default=None,
+                 help='run garbage collection on all synced projects')
+    p.add_option('--no-auto-gc', dest='auto_gc', action='store_false',
+                 help='do not run garbage collection on any projects (default)')
     if show_smart:
       p.add_option('-s', '--smart-sync',
                    dest='smart_sync', action='store_true',
@@ -404,9 +470,10 @@ later is required to fix a server side protocol bug.
     """
     start = time.time()
     success = False
+    remote_fetched = False
     buf = io.StringIO()
     try:
-      success = project.Sync_NetworkHalf(
+      sync_result = project.Sync_NetworkHalf(
           quiet=opt.quiet,
           verbose=opt.verbose,
           output_redir=buf,
@@ -420,6 +487,8 @@ later is required to fix a server side protocol bug.
           ssh_proxy=self.ssh_proxy,
           clone_filter=project.manifest.CloneFilter,
           partial_clone_exclude=project.manifest.PartialCloneExclude)
+      success = sync_result.success
+      remote_fetched = sync_result.remote_fetched
 
       output = buf.getvalue()
       if (opt.verbose or not success) and output:
@@ -437,7 +506,7 @@ later is required to fix a server side protocol bug.
       raise
 
     finish = time.time()
-    return (success, project, start, finish)
+    return _FetchOneResult(success, project, start, finish, remote_fetched)
 
   @classmethod
   def _FetchInitChild(cls, ssh_proxy):
@@ -448,6 +517,7 @@ later is required to fix a server side protocol bug.
 
     jobs = opt.jobs_network
     fetched = set()
+    remote_fetched = set()
     pm = Progress('Fetching', len(projects), delay=False, quiet=opt.quiet)
 
     objdir_project_map = dict()
@@ -458,10 +528,16 @@ later is required to fix a server side protocol bug.
     def _ProcessResults(results_sets):
       ret = True
       for results in results_sets:
-        for (success, project, start, finish) in results:
+        for result in results:
+          success = result.success
+          project = result.project
+          start = result.start
+          finish = result.finish
           self._fetch_times.Set(project, finish - start)
           self.event_log.AddSync(project, event_log.TASK_SYNC_NETWORK,
                                  start, finish, success)
+          if result.remote_fetched:
+            remote_fetched.add(project)
           # Check for any errors before running any more tasks.
           # ...we'll let existing jobs finish, though.
           if not success:
@@ -519,7 +595,7 @@ later is required to fix a server side protocol bug.
     if not self.outer_client.manifest.IsArchive:
       self._GCProjects(projects, opt, err_event)
 
-    return (ret, fetched)
+    return _FetchResult(ret, fetched)
 
   def _FetchMain(self, opt, args, all_projects, err_event,
                  ssh_proxy, manifest):
@@ -545,7 +621,9 @@ later is required to fix a server side protocol bug.
     to_fetch.extend(all_projects)
     to_fetch.sort(key=self._fetch_times.Get, reverse=True)
 
-    success, fetched = self._Fetch(to_fetch, opt, err_event, ssh_proxy)
+    result = self._Fetch(to_fetch, opt, err_event, ssh_proxy)
+    success = result.success
+    fetched = result.projects
     if not success:
       err_event.set()
 
@@ -555,7 +633,7 @@ later is required to fix a server side protocol bug.
       if err_event.is_set():
         print('\nerror: Exited sync due to fetch errors.\n', file=sys.stderr)
         sys.exit(1)
-      return
+      return _FetchMainResult([])
 
     # Iteratively fetch missing and/or nested unregistered submodules
     previously_missing_set = set()
@@ -578,12 +656,14 @@ later is required to fix a server side protocol bug.
       if previously_missing_set == missing_set:
         break
       previously_missing_set = missing_set
-      success, new_fetched = self._Fetch(missing, opt, err_event, ssh_proxy)
+      result = self._Fetch(missing, opt, err_event, ssh_proxy)
+      success = result.success
+      new_fetched = result.projects
       if not success:
         err_event.set()
       fetched.update(new_fetched)
 
-    return all_projects
+    return _FetchMainResult(all_projects)
 
   def _CheckoutOne(self, detach_head, force_sync, project):
     """Checkout work tree for one project
@@ -615,7 +695,7 @@ later is required to fix a server side protocol bug.
     if not success:
       print('error: Cannot checkout %s' % (project.name), file=sys.stderr)
     finish = time.time()
-    return (success, project, start, finish)
+    return _CheckoutOneResult(success, project, start, finish)
 
   def _Checkout(self, all_projects, opt, err_results):
     """Checkout projects listed in all_projects
@@ -630,14 +710,18 @@ later is required to fix a server side protocol bug.
 
     def _ProcessResults(pool, pm, results):
       ret = True
-      for (success, project, start, finish) in results:
+      for result in results:
+        success = result.success
+        project = result.project
+        start = result.start
+        finish = result.finish
         self.event_log.AddSync(project, event_log.TASK_SYNC_LOCAL,
                                start, finish, success)
         # Check for any errors before running any more tasks.
         # ...we'll let existing jobs finish, though.
         if not success:
           ret = False
-          err_results.append(project.relpath)
+          err_results.append(project.RelPath(local=opt.this_manifest_only))
           if opt.fail_fast:
             if pool:
               pool.close()
@@ -652,33 +736,99 @@ later is required to fix a server side protocol bug.
         callback=_ProcessResults,
         output=Progress('Checking out', len(all_projects), quiet=opt.quiet)) and not err_results
 
+  @staticmethod
+  def _GetPreciousObjectsState(project: Project, opt):
+    """Get the preciousObjects state for the project.
+
+    Args:
+      project (Project): the project to examine, and possibly correct.
+      opt (optparse.Values): options given to sync.
+
+    Returns:
+      Expected state of extensions.preciousObjects:
+        False: Should be disabled. (not present)
+        True: Should be enabled.
+    """
+    if project.use_git_worktrees:
+      return False
+    projects = project.manifest.GetProjectsWithName(project.name,
+                                                    all_manifests=True)
+    if len(projects) == 1:
+      return False
+    relpath = project.RelPath(local=opt.this_manifest_only)
+    if len(projects) > 1:
+      # Objects are potentially shared with another project.
+      # See the logic in Project.Sync_NetworkHalf regarding UseAlternates.
+      # - When False, shared projects share (via symlink)
+      #   .repo/project-objects/{PROJECT_NAME}.git as the one-and-only objects
+      #   directory.  All objects are precious, since there is no project with a
+      #   complete set of refs.
+      # - When True, shared projects share (via info/alternates)
+      #   .repo/project-objects/{PROJECT_NAME}.git as an alternate object store,
+      #   which is written only on the first clone of the project, and is not
+      #   written subsequently.  (When Sync_NetworkHalf sees that it exists, it
+      #   makes sure that the alternates file points there, and uses a
+      #   project-local .git/objects directory for all syncs going forward.
+      # We do not support switching between the options.  The environment
+      # variable is present for testing and migration only.
+      return not project.UseAlternates
+    print(f'\r{relpath}: project not found in manifest.', file=sys.stderr)
+    return False
+
+  def _SetPreciousObjectsState(self, project: Project, opt):
+    """Correct the preciousObjects state for the project.
+
+    Args:
+      project: the project to examine, and possibly correct.
+      opt: options given to sync.
+    """
+    expected = self._GetPreciousObjectsState(project, opt)
+    actual = project.config.GetBoolean('extensions.preciousObjects') or False
+    relpath = project.RelPath(local=opt.this_manifest_only)
+
+    if expected != actual:
+      # If this is unexpected, log it and repair.
+      Trace(f'{relpath} expected preciousObjects={expected}, got {actual}')
+      if expected:
+        if not opt.quiet:
+          print('\r%s: Shared project %s found, disabling pruning.' %
+                (relpath, project.name))
+        if git_require((2, 7, 0)):
+          project.EnableRepositoryExtension('preciousObjects')
+        else:
+          # This isn't perfect, but it's the best we can do with old git.
+          print('\r%s: WARNING: shared projects are unreliable when using '
+                'old versions of git; please upgrade to git-2.7.0+.'
+                % (relpath,),
+                file=sys.stderr)
+          project.config.SetString('gc.pruneExpire', 'never')
+      else:
+        if not opt.quiet:
+          print(f'\r{relpath}: not shared, disabling pruning.')
+        project.config.SetString('extensions.preciousObjects', None)
+        project.config.SetString('gc.pruneExpire', None)
+
   def _GCProjects(self, projects, opt, err_event):
-    pm = Progress('Garbage collecting', len(projects), delay=False, quiet=opt.quiet)
+    """Perform garbage collection.
+
+    If We are skipping garbage collection (opt.auto_gc not set), we still want
+    to potentially mark objects precious, so that `git gc` does not discard
+    shared objects.
+    """
+    if not opt.auto_gc:
+      # Just repair preciousObjects state, and return.
+      for project in projects:
+        self._SetPreciousObjectsState(project, opt)
+      return
+
+    pm = Progress('Garbage collecting', len(projects), delay=False,
+                  quiet=opt.quiet)
     pm.update(inc=0, msg='prescan')
 
     tidy_dirs = {}
     for project in projects:
-      # Make sure pruning never kicks in with shared projects that do not use
-      # alternates to avoid corruption.
-      if (not project.use_git_worktrees and
-              len(project.manifest.GetProjectsWithName(project.name, all_manifests=True)) > 1):
-        if project.UseAlternates:
-          # Undo logic set by previous versions of repo.
-          project.config.SetString('extensions.preciousObjects', None)
-          project.config.SetString('gc.pruneExpire', None)
-        else:
-          if not opt.quiet:
-            print('\r%s: Shared project %s found, disabling pruning.' %
-                  (project.relpath, project.name))
-          if git_require((2, 7, 0)):
-            project.EnableRepositoryExtension('preciousObjects')
-          else:
-            # This isn't perfect, but it's the best we can do with old git.
-            print('\r%s: WARNING: shared projects are unreliable when using old '
-                  'versions of git; please upgrade to git-2.7.0+.'
-                  % (project.relpath,),
-                  file=sys.stderr)
-            project.config.SetString('gc.pruneExpire', 'never')
+      self._SetPreciousObjectsState(project, opt)
+
       project.config.SetString('gc.autoDetach', 'false')
       # Only call git gc once per objdir, but call pack-refs for the remainder.
       if project.objdir not in tidy_dirs:
@@ -697,6 +847,7 @@ later is required to fix a server side protocol bug.
     if jobs < 2:
       for (run_gc, bare_git) in tidy_dirs.values():
         pm.update(msg=bare_git._project.name)
+
         if run_gc:
           bare_git.gc('--auto')
         else:
@@ -1033,6 +1184,51 @@ later is required to fix a server side protocol bug.
     if opt.prune is None:
       opt.prune = True
 
+    if opt.auto_gc is None and _AUTO_GC:
+      print(f"Will run `git gc --auto` because {_REPO_AUTO_GC} is set.",
+            f'{_REPO_AUTO_GC} is deprecated and will be removed in a future',
+            'release.  Use `--auto-gc` instead.', file=sys.stderr)
+      opt.auto_gc = True
+
+  def _ValidateOptionsWithManifest(self, opt, mp):
+    """Like ValidateOptions, but after we've updated the manifest.
+
+    Needed to handle sync-xxx option defaults in the manifest.
+
+    Args:
+      opt: The options to process.
+      mp: The manifest project to pull defaults from.
+    """
+    if not opt.jobs:
+      # If the user hasn't made a choice, use the manifest value.
+      opt.jobs = mp.manifest.default.sync_j
+    if opt.jobs:
+      # If --jobs has a non-default value, propagate it as the default for
+      # --jobs-xxx flags too.
+      if not opt.jobs_network:
+        opt.jobs_network = opt.jobs
+      if not opt.jobs_checkout:
+        opt.jobs_checkout = opt.jobs
+    else:
+      # Neither user nor manifest have made a choice, so setup defaults.
+      if not opt.jobs_network:
+        opt.jobs_network = 1
+      if not opt.jobs_checkout:
+        opt.jobs_checkout = DEFAULT_LOCAL_JOBS
+      opt.jobs = os.cpu_count()
+
+    # Try to stay under user rlimit settings.
+    #
+    # Since each worker requires at 3 file descriptors to run `git fetch`, use
+    # that to scale down the number of jobs.  Unfortunately there isn't an easy
+    # way to determine this reliably as systems change, but it was last measured
+    # by hand in 2011.
+    soft_limit, _ = _rlimit_nofile()
+    jobs_soft_limit = max(1, (soft_limit - 5) // 3)
+    opt.jobs = min(opt.jobs, jobs_soft_limit)
+    opt.jobs_network = min(opt.jobs_network, jobs_soft_limit)
+    opt.jobs_checkout = min(opt.jobs_checkout, jobs_soft_limit)
+
   def Execute(self, opt, args):
     manifest = self.outer_manifest
     if not opt.outer_manifest:
@@ -1083,35 +1279,9 @@ later is required to fix a server side protocol bug.
     else:
       print('Skipping update of local manifest project.')
 
-    # Now that the manifests are up-to-date, setup the jobs value.
-    if opt.jobs is None:
-      # User has not made a choice, so use the manifest settings.
-      opt.jobs = mp.default.sync_j
-    if opt.jobs is not None:
-      # Neither user nor manifest have made a choice.
-      if opt.jobs_network is None:
-        opt.jobs_network = opt.jobs
-      if opt.jobs_checkout is None:
-        opt.jobs_checkout = opt.jobs
-    # Setup defaults if jobs==0.
-    if not opt.jobs:
-      if not opt.jobs_network:
-        opt.jobs_network = 1
-      if not opt.jobs_checkout:
-        opt.jobs_checkout = DEFAULT_LOCAL_JOBS
-      opt.jobs = os.cpu_count()
-
-    # Try to stay under user rlimit settings.
-    #
-    # Since each worker requires at 3 file descriptors to run `git fetch`, use
-    # that to scale down the number of jobs.  Unfortunately there isn't an easy
-    # way to determine this reliably as systems change, but it was last measured
-    # by hand in 2011.
-    soft_limit, _ = _rlimit_nofile()
-    jobs_soft_limit = max(1, (soft_limit - 5) // 3)
-    opt.jobs = min(opt.jobs, jobs_soft_limit)
-    opt.jobs_network = min(opt.jobs_network, jobs_soft_limit)
-    opt.jobs_checkout = min(opt.jobs_checkout, jobs_soft_limit)
+    # Now that the manifests are up-to-date, setup options whose defaults might
+    # be in the manifest.
+    self._ValidateOptionsWithManifest(opt, mp)
 
     superproject_logging_data = {}
     self._UpdateProjectsRevisionId(opt, args, superproject_logging_data,
@@ -1160,6 +1330,7 @@ later is required to fix a server side protocol bug.
 
     err_network_sync = False
     err_update_projects = False
+    err_update_linkfiles = False
 
     self._fetch_times = _FetchTimes(manifest)
     if not opt.local_only:
@@ -1167,8 +1338,9 @@ later is required to fix a server side protocol bug.
         with ssh.ProxyManager(manager) as ssh_proxy:
           # Initialize the socket dir once in the parent.
           ssh_proxy.sock()
-          all_projects = self._FetchMain(opt, args, all_projects, err_event,
-                                         ssh_proxy, manifest)
+          result = self._FetchMain(opt, args, all_projects, err_event,
+                                   ssh_proxy, manifest)
+          all_projects = result.all_projects
 
       if opt.network_only:
         return
